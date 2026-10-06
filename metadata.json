@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix PetroFlow ERP - Lubricant Order \u0026 Dispatch---final",
+  "description": "Enterprise Lubricant Order Management, Production, Multi-Stage Dispatch \u0026 Payment Tracking Software",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
