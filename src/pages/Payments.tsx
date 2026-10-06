@@ -9,6 +9,9 @@ import { Payment } from '../types.js';
 
 export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onNavigate }) => {
   const { user } = useAuth();
+  const isSalesPerson = user?.role_slug === 'sales_person';
+  const isAccountsOrAdmin = ['super_admin', 'admin', 'accounts'].includes(user?.role_slug || '');
+
   const [payments, setPayments] = useState<Payment[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [search, setSearch] = useState<string>('');
@@ -16,11 +19,30 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
   const [mode, setMode] = useState<string>('');
   const [dateFrom, setDateFrom] = useState<string>('');
   const [dateTo, setDateTo] = useState<string>('');
+  const [selectedSalesPerson, setSelectedSalesPerson] = useState<string>('ALL');
+  const [salesPersonsList, setSalesPersonsList] = useState<{ id: number; name: string }[]>([]);
+
+  // Summary figures from backend
+  const [summary, setSummary] = useState({
+    totalOrderValue: 0,
+    verifiedReceived: 0,
+    pendingBalance: 0,
+    totalPayments: 0,
+    totalAmount: 0,
+    verifiedPayments: 0,
+    verifiedAmount: 0,
+    pendingVerification: 0,
+    pendingAmount: 0,
+    rejectedPayments: 0,
+    rejectedAmount: 0
+  });
 
   // Modal 1: Add Payment
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
   const [openOrders, setOpenOrders] = useState<any[]>([]);
   const [selectedOrderData, setSelectedOrderData] = useState<any | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
   const [paymentForm, setPaymentForm] = useState({
     order_id: '',
@@ -42,8 +64,6 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
 
   const [actionLoading, setActionLoading] = useState<boolean>(false);
 
-  const isAccountsOrAdmin = ['super_admin', 'admin', 'accounts'].includes(user?.role_slug || '');
-
   const fetchPayments = async () => {
     setLoading(true);
     try {
@@ -54,6 +74,10 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
       if (mode) params.append('payment_mode', mode);
       if (dateFrom) params.append('date_from', dateFrom);
       if (dateTo) params.append('date_to', dateTo);
+      // Only Admin and Accounts can filter by sales person; sales persons are locked to their own data on backend
+      if (!isSalesPerson && selectedSalesPerson !== 'ALL') {
+        params.append('sales_person_id', selectedSalesPerson);
+      }
 
       const res = await fetch(`/api/payments?${params.toString()}`, {
         headers: { Authorization: `Bearer ${token}` }
@@ -61,6 +85,12 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
       if (res.ok) {
         const json = await res.json();
         setPayments(json.payments || []);
+        if (json.summary) {
+          setSummary(json.summary);
+        }
+        if (json.salesPersons) {
+          setSalesPersonsList(json.salesPersons);
+        }
       }
     } catch (err) {
       console.error(err);
@@ -72,22 +102,12 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
   const fetchOpenOrders = async () => {
     try {
       const token = localStorage.getItem('petroflow_token');
-      const res = await fetch('/api/orders?limit=100', {
+      const res = await fetch('/api/payments/eligible-orders', {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
         const json = await res.json();
-        const pending = (json.orders || []).filter((o: any) => o.pending_amount > 0 && o.order_status !== 'CANCELLED');
-        setOpenOrders(pending);
-        if (pending.length > 0) {
-          const first = pending[0];
-          setPaymentForm(prev => ({
-            ...prev,
-            order_id: first.id.toString(),
-            reference_number: `TXN-${Math.floor(100000 + Math.random() * 900000)}`
-          }));
-          setSelectedOrderData(first);
-        }
+        setOpenOrders(json.orders || []);
       }
     } catch (err) {
       console.error(err);
@@ -96,17 +116,36 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
 
   useEffect(() => {
     fetchPayments();
-  }, [status, mode, dateFrom, dateTo]);
+  }, [status, mode, dateFrom, dateTo, selectedSalesPerson]);
+
+  const openAddPaymentModal = () => {
+    setFormError(null);
+    setProofPreview('');
+    setSelectedOrderData(null);
+    setPaymentForm({
+      order_id: '',
+      amount: '',
+      payment_date: new Date().toISOString().slice(0, 10),
+      payment_mode: 'Bank Transfer',
+      reference_number: `TXN-${Math.floor(100000 + Math.random() * 900000)}`,
+      proof_url: '',
+      notes: ''
+    });
+    fetchOpenOrders();
+    setShowAddModal(true);
+  };
 
   // Handle Order Selection inside Add Payment Modal
   const handleOrderChange = (orderIdStr: string) => {
+    setFormError(null);
     const oId = Number(orderIdStr);
     const ord = openOrders.find(o => o.id === oId);
     setSelectedOrderData(ord || null);
     setPaymentForm(prev => ({
       ...prev,
       order_id: orderIdStr,
-      amount: ord ? ord.pending_amount.toString() : ''
+      amount: ord ? ord.pending_amount.toString() : '',
+      reference_number: prev.reference_number || (prev.payment_mode === 'Cash' ? `CASH-${Date.now().toString().slice(-6)}` : `TXN-${Math.floor(100000 + Math.random() * 900000)}`)
     }));
   };
 
@@ -117,11 +156,11 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
 
     const validTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
     if (!validTypes.includes(file.type)) {
-      alert('Please upload a valid JPG, PNG or WebP image');
+      setFormError('Please upload a valid JPG, PNG or WebP image');
       return;
     }
     if (file.size > 5 * 1024 * 1024) {
-      alert('File size must be under 5MB');
+      setFormError('File size must be under 5MB');
       return;
     }
 
@@ -137,26 +176,54 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
   // Submit Payment Entry (starts in PENDING VERIFICATION)
   const handleCreatePaymentSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!paymentForm.order_id || !paymentForm.amount) return;
+    if (actionLoading) return; // Prevent double submit
+    setFormError(null);
+
+    if (!paymentForm.order_id) {
+      setFormError('Please select an Order.');
+      return;
+    }
 
     const amt = Number(paymentForm.amount);
-    if (selectedOrderData && amt > selectedOrderData.pending_amount) {
-      alert(`Payment amount (₹${amt}) cannot exceed pending amount (₹${selectedOrderData.pending_amount})`);
+    if (isNaN(amt) || amt <= 0) {
+      setFormError('Payment amount must be greater than ₹0.');
       return;
+    }
+
+    if (selectedOrderData && amt > selectedOrderData.pending_amount + 0.01) {
+      setFormError(`Payment amount (₹${amt.toLocaleString('en-IN')}) cannot exceed the pending order amount (₹${selectedOrderData.pending_amount.toLocaleString('en-IN')}).`);
+      return;
+    }
+
+    // Reference number check
+    let refNum = (paymentForm.reference_number || '').trim();
+    if (paymentForm.payment_mode !== 'Cash' && !refNum) {
+      setFormError('Please provide a Transaction Ref / UTR / Cheque Number.');
+      return;
+    }
+    if (paymentForm.payment_mode === 'Cash' && !refNum) {
+      refNum = `CASH-${Date.now().toString().slice(-6)}`;
     }
 
     setActionLoading(true);
     try {
       const token = localStorage.getItem('petroflow_token');
+      const payload = {
+        ...paymentForm,
+        reference_number: refNum
+      };
+
       const res = await fetch(`/api/orders/${paymentForm.order_id}/add-payment`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(paymentForm)
+        body: JSON.stringify(payload)
       });
       const data = await res.json();
       if (res.ok) {
         setShowAddModal(false);
         setProofPreview('');
+        setSuccessMessage(data.message || `Payment entry ${data.payment_number || ''} submitted successfully and sent for Accounts verification.`);
+        setTimeout(() => setSuccessMessage(null), 7000);
         setPaymentForm({
           order_id: '',
           amount: '',
@@ -167,9 +234,12 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
           notes: ''
         });
         fetchPayments();
+        fetchOpenOrders();
       } else {
-        alert(data.error || 'Payment submission failed');
+        setFormError(data.error || 'Payment submission failed. Please try again.');
       }
+    } catch (err: any) {
+      setFormError(err.message || 'Payment submission failed due to a network error.');
     } finally {
       setActionLoading(false);
     }
@@ -239,19 +309,29 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
       {/* Page Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-xl sm:text-2xl font-bold text-slate-900 tracking-tight flex items-center gap-2">
-            <CreditCard className="w-6 h-6 text-emerald-600" />
-            Payments & Financial Ledger
-          </h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-xl sm:text-2xl font-bold text-slate-900 tracking-tight flex items-center gap-2">
+              <CreditCard className="w-6 h-6 text-emerald-600" />
+              Payments & Financial Ledger
+            </h1>
+            {isSalesPerson && (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-amber-50 text-amber-800 border border-amber-300 rounded-full text-xs font-bold shadow-2xs">
+                <User className="w-3.5 h-3.5 text-amber-600" />
+                <span>Viewing: My Payments ({user?.name})</span>
+              </span>
+            )}
+          </div>
           <p className="text-xs text-slate-500 mt-1">
-            Submit customer payment proofs against orders, manage Accounts Team verification workflow, and track reconciled ledger balances.
+            {isSalesPerson
+              ? 'Submit client payment proofs against your orders, monitor accounts verification status, and track your active collection ledger.'
+              : 'Submit customer payment proofs against orders, manage Accounts Team verification workflow, and track reconciled ledger balances.'}
           </p>
         </div>
 
         <div className="flex items-center gap-2.5">
           <button
             onClick={() => fetchPayments()}
-            className="p-2 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 flex items-center gap-1.5"
+            className="p-2 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold text-slate-700 flex items-center gap-1.5 shadow-xs"
             title="Refresh Ledger"
           >
             <RefreshCw className="w-4 h-4" />
@@ -259,11 +339,8 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
 
           {/* Any authorized user or Sales Person can submit payment! */}
           <button
-            onClick={() => {
-              fetchOpenOrders();
-              setShowAddModal(true);
-            }}
-            className="px-4 py-2 bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 hover:to-emerald-800 text-white font-bold text-xs rounded-xl shadow-xs transition flex items-center gap-2"
+            onClick={openAddPaymentModal}
+            className="px-4 py-2.5 bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 hover:to-emerald-800 text-white font-bold text-xs rounded-xl shadow-xs transition flex items-center gap-2"
           >
             <Plus className="w-4 h-4" />
             <span>+ Submit Payment Entry</span>
@@ -271,43 +348,60 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
         </div>
       </div>
 
+      {/* Global Success Notification */}
+      {successMessage && (
+        <div className="p-4 bg-emerald-50 border border-emerald-300 rounded-xl text-emerald-900 text-xs font-semibold flex items-center justify-between shadow-xs">
+          <div className="flex items-center gap-2.5">
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+            <span>{successMessage}</span>
+          </div>
+          <button onClick={() => setSuccessMessage(null)} className="text-emerald-700 hover:text-emerald-900">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {/* Financial KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-          <p className="text-xs font-semibold text-slate-500">Gross Submitted Receipts</p>
+          <p className="text-xs font-semibold text-slate-500">{isSalesPerson ? 'Total Order Value' : 'Total Order Value'}</p>
           <p className="text-2xl font-bold text-slate-900 font-mono mt-1">
-            ₹{totalAmount.toLocaleString('en-IN')}
+            ₹{(summary.totalOrderValue || 0).toLocaleString('en-IN')}
           </p>
-          <p className="text-[11px] text-slate-400 mt-1">{payments.length} total transaction entries</p>
+          <p className="text-[11px] text-slate-400 mt-1">
+            {isSalesPerson
+              ? 'My confirmed order book'
+              : (!isSalesPerson && selectedSalesPerson !== 'ALL' ? 'Selected Sales Officer' : 'Company commercial book')}
+          </p>
         </div>
 
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-          <p className="text-xs font-semibold text-slate-500">Reconciled & Verified</p>
+          <p className="text-xs font-semibold text-slate-500">Verified Received</p>
           <p className="text-2xl font-bold text-emerald-600 font-mono mt-1">
-            ₹{verifiedAmount.toLocaleString('en-IN')}
+            ₹{(summary.verifiedReceived || 0).toLocaleString('en-IN')}
           </p>
           <div className="flex items-center gap-1 text-[11px] text-emerald-700 mt-1">
             <CheckCircle2 className="w-3.5 h-3.5" />
-            <span>Passed accounts ledger audit</span>
+            <span>Accounts audited & reconciled</span>
           </div>
         </div>
 
-        <div className="bg-white p-5 rounded-2xl border border-amber-200 bg-amber-50/20 shadow-xs">
-          <p className="text-xs font-semibold text-slate-700">Pending Accounts Audit</p>
-          <p className="text-2xl font-bold text-amber-600 font-mono mt-1">
-            {pendingPayments.length} Payments
+        <div className="bg-white p-5 rounded-2xl border border-rose-200 bg-rose-50/20 shadow-xs">
+          <p className="text-xs font-semibold text-slate-700">Pending</p>
+          <p className="text-2xl font-bold text-rose-600 font-mono mt-1">
+            ₹{(summary.pendingBalance || 0).toLocaleString('en-IN')}
           </p>
-          <p className="text-[11px] text-amber-800 mt-1">
-            ₹{pendingPayments.reduce((a, b) => a + b.amount, 0).toLocaleString('en-IN')} awaiting review
-          </p>
+          <p className="text-[11px] text-slate-400 mt-1">Outstanding receivable balance</p>
         </div>
 
-        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">
-          <p className="text-xs font-semibold text-slate-500">Rejected Receipts</p>
-          <p className="text-2xl font-bold text-rose-600 font-mono mt-1">
-            {rejectedPayments.length} Records
+        <div className="bg-white p-5 rounded-2xl border border-amber-200 bg-amber-50/30 shadow-xs">
+          <p className="text-xs font-semibold text-slate-700">Pending Verification</p>
+          <p className="text-2xl font-bold text-amber-600 font-mono mt-1">
+            {summary.pendingVerification || 0} Payments
           </p>
-          <p className="text-[11px] text-slate-400 mt-1">Declined during verification</p>
+          <p className="text-[11px] text-amber-800 mt-1">
+            ₹{(summary.pendingAmount || 0).toLocaleString('en-IN')} awaiting audit
+          </p>
         </div>
       </div>
 
@@ -513,7 +607,7 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
 
       {/* Filter and Search Bar */}
       <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs space-y-3">
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
           <div className="sm:col-span-2">
             <div className="relative">
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -556,12 +650,76 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
             </select>
           </div>
 
+          {/* Sales Person Scope Filter: Strict isolation for Sales Person */}
+          <div>
+            {isSalesPerson ? (
+              <div className="flex items-center gap-1.5 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs font-semibold text-amber-800 h-full">
+                <User className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                <span className="truncate">Viewing: My Payments</span>
+              </div>
+            ) : (
+              <select
+                value={selectedSalesPerson}
+                onChange={(e) => setSelectedSalesPerson(e.target.value)}
+                className="w-full py-2 px-3 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-800"
+              >
+                <option value="ALL">All Sales Persons</option>
+                {salesPersonsList.map(sp => (
+                  <option key={sp.id} value={sp.id}>{sp.name}</option>
+                ))}
+              </select>
+            )}
+          </div>
+
           <button
             onClick={fetchPayments}
-            className="py-2 px-4 bg-slate-900 text-white rounded-lg text-xs font-bold hover:bg-slate-800 transition"
+            className="py-2 px-4 bg-slate-900 text-white rounded-lg text-xs font-bold hover:bg-slate-800 transition flex items-center justify-center gap-1.5"
           >
-            Apply Filter
+            <Filter className="w-3.5 h-3.5" />
+            <span>Apply Filter</span>
           </button>
+        </div>
+
+        {/* Date Filters Row */}
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-100 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-slate-500 font-semibold text-[11px] uppercase">Payment Date:</span>
+            <input
+              type="date"
+              value={dateFrom}
+              onChange={(e) => setDateFrom(e.target.value)}
+              className="py-1 px-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-700"
+              placeholder="From Date"
+            />
+            <span className="text-slate-400">to</span>
+            <input
+              type="date"
+              value={dateTo}
+              onChange={(e) => setDateTo(e.target.value)}
+              className="py-1 px-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-700"
+              placeholder="To Date"
+            />
+            {(dateFrom || dateTo || search || status !== 'ALL' || mode !== '' || (!isSalesPerson && selectedSalesPerson !== 'ALL')) && (
+              <button
+                type="button"
+                onClick={() => {
+                  setDateFrom('');
+                  setDateTo('');
+                  setSearch('');
+                  setStatus('ALL');
+                  setMode('');
+                  if (!isSalesPerson) setSelectedSalesPerson('ALL');
+                }}
+                className="text-xs text-rose-600 hover:text-rose-800 font-semibold px-2 py-1 hover:bg-rose-50 rounded"
+              >
+                Reset Filters
+              </button>
+            )}
+          </div>
+
+          <span className="text-slate-400 text-[11px]">
+            {isSalesPerson ? 'Showing your personal payment transactions' : 'Company ledger & audit trail'}
+          </span>
         </div>
       </div>
 
@@ -825,21 +983,39 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
             </div>
 
             <form onSubmit={handleCreatePaymentSubmit} className="space-y-4 text-xs">
+              {/* Form Error Banner */}
+              {formError && (
+                <div className="p-3 bg-rose-50 border border-rose-300 rounded-xl text-rose-800 text-xs font-semibold flex items-start gap-2 shadow-xs">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <div className="flex-1">{formError}</div>
+                  <button type="button" onClick={() => setFormError(null)} className="text-rose-500 hover:text-rose-700">
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
               {/* Order Selection */}
               <div>
-                <label className="block font-semibold text-slate-700 mb-1">Select Order ID *</label>
+                <label className="block font-semibold text-slate-700 mb-1">
+                  Select Order ID *
+                  {isSalesPerson && <span className="text-[11px] font-normal text-slate-500 ml-1.5">(Showing your orders only)</span>}
+                </label>
                 <select
                   required
                   value={paymentForm.order_id}
                   onChange={(e) => handleOrderChange(e.target.value)}
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold text-slate-900"
+                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl font-mono font-bold text-slate-900 focus:bg-white focus:border-emerald-500"
                 >
                   <option value="">-- Choose Order with Pending Balance --</option>
-                  {openOrders.map(o => (
-                    <option key={o.id} value={o.id}>
-                      {o.order_number} — {o.vendor_name} (Pending: ₹{o.pending_amount.toLocaleString('en-IN')})
-                    </option>
-                  ))}
+                  {openOrders.length === 0 ? (
+                    <option value="" disabled>No open orders with pending balance available</option>
+                  ) : (
+                    openOrders.map(o => (
+                      <option key={o.id} value={o.id}>
+                        {o.order_number} — {o.vendor_name} (Pending: ₹{Number(o.pending_amount).toLocaleString('en-IN')})
+                      </option>
+                    ))
+                  )}
                 </select>
               </div>
 
@@ -847,24 +1023,27 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
               {selectedOrderData && (
                 <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
                   <div>
-                    <span className="text-slate-400">Vendor / Client:</span>
+                    <span className="text-slate-400 font-semibold uppercase text-[10px] block">Vendor</span>
                     <p className="font-bold text-slate-800">{selectedOrderData.vendor_name}</p>
                   </div>
                   <div>
-                    <span className="text-slate-400">Billing Company:</span>
+                    <span className="text-slate-400 font-semibold uppercase text-[10px] block">Billing Company</span>
                     <p className="font-bold text-slate-800">{selectedOrderData.billing_company_name}</p>
                   </div>
                   <div>
-                    <span className="text-slate-400">Total Order Amount:</span>
-                    <p className="font-mono font-bold text-slate-900">₹{selectedOrderData.grand_total.toLocaleString('en-IN')}</p>
+                    <span className="text-slate-400 font-semibold uppercase text-[10px] block">Order Grand Total</span>
+                    <p className="font-mono font-bold text-slate-900">₹{Number(selectedOrderData.grand_total).toLocaleString('en-IN')}</p>
                   </div>
                   <div>
-                    <span className="text-slate-400">Current Verified Received:</span>
-                    <p className="font-mono font-bold text-emerald-600">₹{(selectedOrderData.amount_received ?? 0).toLocaleString('en-IN')}</p>
+                    <span className="text-slate-400 font-semibold uppercase text-[10px] block">Current Verified Received</span>
+                    <p className="font-mono font-bold text-emerald-600">₹{Number(selectedOrderData.amount_received ?? 0).toLocaleString('en-IN')}</p>
                   </div>
-                  <div className="sm:col-span-2 pt-2 border-t border-slate-200 flex justify-between">
-                    <span className="font-bold text-slate-700">Current Pending Amount:</span>
-                    <span className="font-mono font-bold text-sm text-rose-600">₹{selectedOrderData.pending_amount.toLocaleString('en-IN')}</span>
+                  <div className="sm:col-span-2 pt-2 border-t border-slate-200 flex items-center justify-between">
+                    <div>
+                      <span className="font-bold text-slate-700">Current Pending Amount:</span>
+                      <p className="text-[10px] text-slate-400">Remaining receivable balance</p>
+                    </div>
+                    <span className="font-mono font-bold text-base text-rose-600">₹{Number(selectedOrderData.pending_amount).toLocaleString('en-IN')}</span>
                   </div>
                 </div>
               )}
@@ -872,15 +1051,27 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
               {/* Payment Amount & Date */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Payment Amount (₹) *</label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block font-semibold text-slate-700">Payment Amount (₹) *</label>
+                    {selectedOrderData && (
+                      <button
+                        type="button"
+                        onClick={() => setPaymentForm(prev => ({ ...prev, amount: selectedOrderData.pending_amount.toString() }))}
+                        className="text-[10px] font-bold text-emerald-600 hover:text-emerald-700 underline"
+                      >
+                        Set Full Pending
+                      </button>
+                    )}
+                  </div>
                   <input
                     type="number"
                     required
                     min="1"
+                    step="any"
                     max={selectedOrderData?.pending_amount}
                     value={paymentForm.amount}
                     onChange={(e) => setPaymentForm({ ...paymentForm, amount: e.target.value })}
-                    className="w-full p-2.5 bg-white border border-slate-300 rounded-xl font-mono font-bold text-emerald-700 text-sm"
+                    className="w-full p-2.5 bg-white border border-slate-300 rounded-xl font-mono font-bold text-emerald-700 text-sm focus:border-emerald-500"
                     placeholder="e.g. 25000"
                   />
                 </div>
@@ -892,7 +1083,7 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
                     required
                     value={paymentForm.payment_date}
                     onChange={(e) => setPaymentForm({ ...paymentForm, payment_date: e.target.value })}
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl"
+                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white"
                   />
                 </div>
               </div>
@@ -903,26 +1094,37 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
                   <label className="block font-semibold text-slate-700 mb-1">Payment Mode *</label>
                   <select
                     value={paymentForm.payment_mode}
-                    onChange={(e) => setPaymentForm({ ...paymentForm, payment_mode: e.target.value })}
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl font-medium"
+                    onChange={(e) => {
+                      const newMode = e.target.value;
+                      setPaymentForm(prev => ({
+                        ...prev,
+                        payment_mode: newMode,
+                        reference_number: newMode === 'Cash' ? (prev.reference_number || `CASH-${Date.now().toString().slice(-6)}`) : prev.reference_number
+                      }));
+                    }}
+                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl font-medium focus:bg-white"
                   >
-                    <option value="Cash">Cash</option>
-                    <option value="UPI">UPI (GPay / PhonePe / Paytm)</option>
                     <option value="Bank Transfer">Bank Transfer / NEFT / RTGS</option>
+                    <option value="UPI">UPI (GPay / PhonePe / Paytm / QR)</option>
                     <option value="Cheque">Cheque</option>
+                    <option value="Cash">Cash</option>
                     <option value="Other">Other</option>
                   </select>
                 </div>
 
                 <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Transaction Ref / UTR / Cheque # *</label>
+                  <label className="block font-semibold text-slate-700 mb-1">
+                    {paymentForm.payment_mode === 'Cash'
+                      ? 'Reference / Receipt Voucher # (Optional for Cash)'
+                      : 'Reference / Transaction / UTR / Cheque Number *'}
+                  </label>
                   <input
                     type="text"
-                    required
+                    required={paymentForm.payment_mode !== 'Cash'}
                     value={paymentForm.reference_number}
                     onChange={(e) => setPaymentForm({ ...paymentForm, reference_number: e.target.value })}
-                    placeholder="e.g. UTR-99823102"
-                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl font-mono uppercase"
+                    placeholder={paymentForm.payment_mode === 'Cash' ? 'e.g. CASH-01' : 'e.g. UTR-99823102'}
+                    className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl font-mono uppercase focus:bg-white"
                   />
                 </div>
               </div>
@@ -947,7 +1149,7 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
                       <button
                         type="button"
                         onClick={() => { setProofPreview(''); setPaymentForm({ ...paymentForm, proof_url: '' }); }}
-                        className="text-[11px] text-rose-600 hover:underline"
+                        className="text-[11px] text-rose-600 hover:underline font-semibold"
                       >
                         Remove
                       </button>
@@ -964,24 +1166,31 @@ export const Payments: React.FC<{ onNavigate: (page: string) => void }> = ({ onN
                   value={paymentForm.notes}
                   onChange={(e) => setPaymentForm({ ...paymentForm, notes: e.target.value })}
                   placeholder="e.g. 50% advance for dispatch clearance"
-                  className="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl"
+                  className="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white"
                 />
               </div>
 
               {/* Submitted By */}
               <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 flex items-center justify-between text-xs text-amber-900">
                 <span>Submitted By: <strong>{user?.name} ({user?.role_name})</strong></span>
-                <span className="font-bold text-[10px] bg-amber-200 px-2 py-0.5 rounded uppercase">Pending Verification</span>
+                <span className="font-bold text-[10px] bg-amber-200 text-amber-900 px-2 py-0.5 rounded uppercase">Pending Verification</span>
               </div>
 
               <div className="flex justify-end gap-2 pt-3 border-t">
-                <button type="button" onClick={() => setShowAddModal(false)} className="px-4 py-2 text-slate-600">Cancel</button>
+                <button type="button" onClick={() => setShowAddModal(false)} className="px-4 py-2 text-slate-600 hover:bg-slate-50 rounded-xl font-medium">Cancel</button>
                 <button
                   type="submit"
                   disabled={actionLoading}
-                  className="px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 text-white font-bold rounded-xl shadow-xs"
+                  className="px-6 py-2.5 bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 text-white font-bold rounded-xl shadow-xs flex items-center gap-2 disabled:opacity-50"
                 >
-                  Submit Payment for Verification
+                  {actionLoading ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                      <span>Submitting Payment Entry...</span>
+                    </>
+                  ) : (
+                    <span>Submit Payment Entry</span>
+                  )}
                 </button>
               </div>
             </form>

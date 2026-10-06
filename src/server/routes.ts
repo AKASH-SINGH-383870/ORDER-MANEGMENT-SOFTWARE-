@@ -1421,7 +1421,7 @@ apiRouter.get('/orders', authMiddleware, (req: AuthRequest, res) => {
   const params: any[] = [];
 
   // Security Rule: Sales Person or view_own only sees own orders!
-  if (!canViewAll && canViewOwn) {
+  if (user.role_slug === 'sales_person' || (!canViewAll && canViewOwn)) {
     sql += ' AND o.sales_person_id = ?';
     params.push(user.id);
   } else if (sales_person_id && sales_person_id !== 'ALL') {
@@ -2450,9 +2450,35 @@ apiRouter.post('/orders/:id/update-delivery', authMiddleware, requirePermission(
 // PAYMENTS MODULE
 // -------------------------------------------------------------
 
+// Eligible Orders for Payment Submission (Strict ownership isolation for Sales Persons)
+apiRouter.get('/payments/eligible-orders', authMiddleware, (req: AuthRequest, res) => {
+  const user = req.user!;
+  const isSalesPerson = user.role_slug === 'sales_person';
+  let sql = `
+    SELECT o.id, o.order_number, o.grand_total, o.amount_received, o.pending_amount,
+           o.payment_status, o.order_status, o.sales_person_id,
+           v.company_name as vendor_name,
+           c.name as billing_company_name,
+           u.name as sales_person_name
+    FROM orders o
+    JOIN vendors v ON o.vendor_id = v.id
+    JOIN companies c ON o.company_id = c.id
+    JOIN users u ON o.sales_person_id = u.id
+    WHERE o.order_status != 'CANCELLED' AND o.pending_amount > 0.01
+  `;
+  const params: any[] = [];
+  if (isSalesPerson) {
+    sql += ' AND o.sales_person_id = ?';
+    params.push(user.id);
+  }
+  sql += ' ORDER BY o.id DESC';
+  const orders = db.prepare(sql).all(...params);
+  res.json({ orders });
+});
+
 apiRouter.get('/payments', authMiddleware, (req: AuthRequest, res) => {
   const user = req.user!;
-  const canView = user.role_slug === 'super_admin' || user.permissions.includes('payments:view') || user.permissions.includes('payments:add') || user.role_slug === 'admin' || user.role_slug === 'accounts' || user.role_slug === 'sales_person';
+  const canView = user.role_slug === 'super_admin' || user.permissions.includes('payments:view') || user.permissions.includes('payments:add') || user.permissions.includes('payments:view_own') || user.permissions.includes('payments:view_all') || user.role_slug === 'admin' || user.role_slug === 'accounts' || user.role_slug === 'sales_person';
   if (!canView) {
     return res.status(403).json({ error: 'Forbidden: You do not have permission to access Payments & Ledger' });
   }
@@ -2466,6 +2492,7 @@ apiRouter.get('/payments', authMiddleware, (req: AuthRequest, res) => {
            o.order_number, o.grand_total, o.grand_total as total_order_amount,
            o.amount_received as order_total_received, o.pending_amount, o.pending_amount as order_pending,
            o.payment_status as order_payment_status,
+           o.sales_person_id as order_sales_person_id,
            v.company_name as vendor_name,
            c.name as billing_company_name,
            sp.name as sales_person_name,
@@ -2483,9 +2510,10 @@ apiRouter.get('/payments', authMiddleware, (req: AuthRequest, res) => {
   `;
   const params: any[] = [];
 
-  // Security: Sales Person only views their own client payments unless they have full admin/super_admin view
+  // Security: Sales Person ONLY views payment records belonging to their own orders!
+  // Backend MUST strictly enforce ownership. Do not take sales_person_id from query if user is sales_person.
   const isSalesPerson = user.role_slug === 'sales_person';
-  if (isSalesPerson && !user.permissions.includes('payments:view_all') && !user.permissions.includes('orders:view_all')) {
+  if (isSalesPerson) {
     sql += ' AND o.sales_person_id = ?';
     params.push(user.id);
   } else if (sales_person_id && sales_person_id !== 'ALL') {
@@ -2552,24 +2580,71 @@ apiRouter.get('/payments', authMiddleware, (req: AuthRequest, res) => {
   const rejectedList = payments.filter(p => p.is_verified === -1 || p.status === 'REJECTED');
   const rejectedAmount = rejectedList.reduce((acc, p) => acc + (p.amount || 0), 0);
 
-  const salesPersons = db.prepare(`
-    SELECT DISTINCT u.id, u.name
-    FROM users u
-    JOIN roles r ON u.role_id = r.id
-    WHERE r.slug = 'sales_person' OR u.id IN (SELECT sales_person_id FROM orders)
-    ORDER BY u.name ASC
-  `).all();
+  // Compute accurate in-scope Order Book Totals (Total Order Value, Verified Received, Pending Balance)
+  let orderScopeSql = "WHERE o.order_status != 'CANCELLED'";
+  const orderScopeParams: any[] = [];
+  if (isSalesPerson) {
+    orderScopeSql += ' AND o.sales_person_id = ?';
+    orderScopeParams.push(user.id);
+  } else if (sales_person_id && sales_person_id !== 'ALL') {
+    orderScopeSql += ' AND (o.sales_person_id = ? OR sp.name = ?)';
+    orderScopeParams.push(sales_person_id, sales_person_id);
+  }
+  if (vendor_id && vendor_id !== 'ALL') {
+    orderScopeSql += ' AND (o.vendor_id = ? OR v.company_name = ?)';
+    orderScopeParams.push(vendor_id, vendor_id);
+  }
+  if (sDate) {
+    orderScopeSql += ' AND DATE(o.created_at) >= ?';
+    orderScopeParams.push(sDate);
+  }
+  if (eDate) {
+    orderScopeSql += ' AND DATE(o.created_at) <= ?';
+    orderScopeParams.push(eDate);
+  }
 
-  const vendors = db.prepare(`
-    SELECT DISTINCT v.id, v.company_name as name
-    FROM vendors v
-    WHERE v.status = 'active' OR v.id IN (SELECT vendor_id FROM orders)
-    ORDER BY v.company_name ASC
-  `).all();
+  const orderFinancials = db.prepare(`
+    SELECT
+      COALESCE(SUM(o.grand_total), 0) as total_order_value,
+      COALESCE(SUM(o.amount_received), 0) as total_verified_received,
+      COALESCE(SUM(o.pending_amount), 0) as total_pending_amount
+    FROM orders o
+    JOIN users sp ON o.sales_person_id = sp.id
+    JOIN vendors v ON o.vendor_id = v.id
+    ${orderScopeSql}
+  `).get(...orderScopeParams) as any;
+
+  // Sales Persons List: for normal Sales Person, only return their own profile (no other reps exposed)
+  const salesPersons = isSalesPerson
+    ? [{ id: user.id, name: user.name }]
+    : db.prepare(`
+        SELECT DISTINCT u.id, u.name
+        FROM users u
+        JOIN roles r ON u.role_id = r.id
+        WHERE r.slug = 'sales_person' OR u.id IN (SELECT sales_person_id FROM orders)
+        ORDER BY u.name ASC
+      `).all();
+
+  const vendors = isSalesPerson
+    ? db.prepare(`
+        SELECT DISTINCT v.id, v.company_name as name
+        FROM vendors v
+        WHERE v.assigned_sales_person_id = ? OR v.id IN (SELECT vendor_id FROM orders WHERE sales_person_id = ?)
+        ORDER BY v.company_name ASC
+      `).all(user.id, user.id)
+    : db.prepare(`
+        SELECT DISTINCT v.id, v.company_name as name
+        FROM vendors v
+        WHERE v.status = 'active' OR v.id IN (SELECT vendor_id FROM orders)
+        ORDER BY v.company_name ASC
+      `).all();
 
   res.json({
     payments,
     summary: {
+      totalOrderValue: orderFinancials?.total_order_value || 0,
+      verifiedReceived: orderFinancials?.total_verified_received || 0,
+      pendingBalance: orderFinancials?.total_pending_amount || 0,
       totalPayments: payments.length,
       totalAmount,
       verifiedPayments: verifiedList.length,
@@ -2584,40 +2659,142 @@ apiRouter.get('/payments', authMiddleware, (req: AuthRequest, res) => {
   });
 });
 
-apiRouter.post('/orders/:id/add-payment', authMiddleware, requirePermission('payments:add'), (req: AuthRequest, res) => {
+// Single Payment Details with strict data isolation
+apiRouter.get('/payments/:id', authMiddleware, (req: AuthRequest, res) => {
   const user = req.user!;
   const { id } = req.params;
-  const { amount, payment_date, payment_mode, reference_number, proof_url, notes } = req.body;
 
-  const paymentAmt = Number(amount);
-  if (isNaN(paymentAmt) || paymentAmt <= 0) {
-    return res.status(400).json({ error: 'Valid payment amount greater than zero is required' });
+  const payment = db.prepare(`
+    SELECT p.*,
+           o.order_number, o.grand_total, o.grand_total as total_order_amount,
+           o.amount_received as order_total_received, o.pending_amount, o.pending_amount as order_pending,
+           o.payment_status as order_payment_status, o.sales_person_id,
+           v.company_name as vendor_name,
+           c.name as billing_company_name,
+           sp.name as sales_person_name,
+           u.name as received_by_name,
+           u.name as submitted_by_name,
+           vu.name as verified_by_name
+    FROM payments p
+    JOIN orders o ON p.order_id = o.id
+    JOIN vendors v ON o.vendor_id = v.id
+    JOIN companies c ON o.company_id = c.id
+    JOIN users sp ON o.sales_person_id = sp.id
+    JOIN users u ON p.received_by_id = u.id
+    LEFT JOIN users vu ON p.verified_by_id = vu.id
+    WHERE p.id = ? OR p.payment_number = ?
+  `).get(id, id) as any;
+
+  if (!payment) {
+    return res.status(404).json({ error: 'Payment record not found' });
   }
 
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as any;
+  // Security Check: Sales Person can ONLY access payment details for their own orders!
+  if (user.role_slug === 'sales_person' && payment.sales_person_id !== user.id) {
+    return res.status(403).json({ error: 'Forbidden: Access denied. You can only view payments for your own orders.' });
+  }
+
+  res.json({ payment });
+});
+
+// Order Payments List with strict data isolation
+apiRouter.get('/orders/:id/payments', authMiddleware, (req: AuthRequest, res) => {
+  const user = req.user!;
+  const { id } = req.params;
+
+  const order = db.prepare('SELECT id, order_number, sales_person_id FROM orders WHERE id = ? OR order_number = ?').get(id, id) as any;
   if (!order) return res.status(404).json({ error: 'Order not found' });
+
+  // Security Check: Sales Person can ONLY access payment records for their own orders!
+  if (user.role_slug === 'sales_person' && order.sales_person_id !== user.id) {
+    return res.status(403).json({ error: 'Forbidden: Access denied. You can only view payments for your own orders.' });
+  }
+
+  const payments = db.prepare(`
+    SELECT p.*,
+           u.name as received_by_name,
+           u.name as submitted_by_name,
+           vu.name as verified_by_name
+    FROM payments p
+    JOIN users u ON p.received_by_id = u.id
+    LEFT JOIN users vu ON p.verified_by_id = vu.id
+    WHERE p.order_id = ?
+    ORDER BY p.id DESC
+  `).all(order.id);
+
+  res.json({ payments });
+});
+
+// Shared robust Payment Submission Handler
+function executePaymentSubmission(req: AuthRequest, res: Response, targetOrderId: any, bodyData: any) {
+  const user = req.user!;
+  const canSubmit = user.role_slug === 'super_admin' || user.role_slug === 'admin' || user.role_slug === 'accounts' || user.role_slug === 'sales_person' || user.permissions.includes('payments:add') || user.permissions.includes('payments:submit') || user.permissions.includes('payments.add') || user.permissions.includes('payments.submit');
+
+  if (!canSubmit) {
+    return res.status(403).json({ error: 'Forbidden: You do not have permission to submit payment entries' });
+  }
+
+  const orderId = targetOrderId || bodyData.order_id;
+  if (!orderId) {
+    return res.status(400).json({ error: 'Please select an Order.' });
+  }
+
+  const order = db.prepare('SELECT * FROM orders WHERE id = ? OR order_number = ?').get(orderId, orderId) as any;
+  if (!order) {
+    return res.status(404).json({ error: 'Selected Order does not exist' });
+  }
+
   if (order.order_status === 'CANCELLED') {
     return res.status(400).json({ error: 'Cannot record payment for a cancelled order' });
   }
 
-  if (paymentAmt > order.pending_amount) {
+  // Security Rule: Sales Person can ONLY submit payment against THEIR OWN Order!
+  // Backend derives ownership from Order, not trusting frontend-submitted salesPersonId.
+  if (user.role_slug === 'sales_person' && order.sales_person_id !== user.id) {
+    return res.status(403).json({ error: 'You cannot submit payment against another Sales Person\'s order' });
+  }
+
+  const { amount, payment_date, payment_mode, reference_number, proof_url, notes } = bodyData;
+
+  const paymentAmt = Number(amount);
+  if (isNaN(paymentAmt) || paymentAmt <= 0) {
+    return res.status(400).json({ error: 'Payment amount must be greater than ₹0.' });
+  }
+
+  // Recalculate current verified/pending amount on backend to guarantee freshness and prevent overpayment
+  const verifiedResult = db.prepare(`
+    SELECT COALESCE(SUM(amount), 0) as total
+    FROM payments
+    WHERE order_id = ? AND (is_verified = 1 OR status = 'VERIFIED')
+  `).get(order.id) as { total: number };
+
+  const currentVerified = verifiedResult?.total || 0;
+  const currentPending = Math.max(0, order.grand_total - currentVerified);
+
+  if (currentPending <= 0) {
+    return res.status(400).json({ error: 'This order is already fully paid. No pending balance remains.' });
+  }
+
+  if (paymentAmt > currentPending + 0.01) {
     return res.status(400).json({
-      error: `Payment amount (₹${paymentAmt.toLocaleString('en-IN')}) cannot exceed pending balance (₹${order.pending_amount.toLocaleString('en-IN')})`
+      error: `Payment amount (₹${paymentAmt.toLocaleString('en-IN')}) exceeds the pending order amount (₹${currentPending.toLocaleString('en-IN')}).`
     });
   }
 
-  const lastPay = db.prepare('SELECT id FROM payments ORDER BY id DESC LIMIT 1').get() as { id: number };
-  const payNumber = `PAY-${3000 + (lastPay?.id || 0) + 1}`;
+  // Generate unique payment/transaction ID: PAY-10025 format
+  const lastPayment = db.prepare('SELECT id FROM payments ORDER BY id DESC LIMIT 1').get() as { id: number };
+  const nextNum = 10000 + (lastPayment?.id || 0) + 1;
+  const payNumber = `PAY-${nextNum}`;
 
-  // Business Requirement 4: Submitted payments ALWAYS start as PENDING VERIFICATION!
-  // Do NOT immediately add submitted amount to the verified received amount.
-  db.prepare(`
+  // IMPORTANT: Do NOT immediately increase Verified Received!
+  // Submitted payment ALWAYS starts as PENDING_VERIFICATION (is_verified = 0)
+  const insertResult = db.prepare(`
     INSERT INTO payments (
       payment_number, order_id, amount, payment_date, payment_mode, reference_number,
       proof_url, status, notes, is_verified, received_by_id
     ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_VERIFICATION', ?, 0, ?)
   `).run(
-    payNumber, id, paymentAmt,
+    payNumber, order.id, paymentAmt,
     payment_date || new Date().toISOString().slice(0, 10),
     payment_mode || 'Bank Transfer',
     reference_number || `TXN-${Date.now().toString().slice(-6)}`,
@@ -2626,19 +2803,62 @@ apiRouter.post('/orders/:id/add-payment', authMiddleware, requirePermission('pay
     user.id
   );
 
+  const newPaymentId = insertResult.lastInsertRowid;
+
+  // Create audit / order status history entry
   db.prepare(`
     INSERT INTO order_status_history (order_id, stage_name, previous_status, new_status, notes, created_by_id)
     VALUES (?, 'Payment Submitted', ?, ?, ?, ?)
-  `).run(id, order.payment_status, order.payment_status, `Payment of ₹${paymentAmt.toLocaleString('en-IN')} submitted by ${user.name} via ${payment_mode} (Ref: ${reference_number || 'N/A'}). Awaiting Accounts Verification.`, user.id);
+  `).run(
+    order.id,
+    order.payment_status,
+    order.payment_status,
+    `Payment entry ${payNumber} of ₹${paymentAmt.toLocaleString('en-IN')} submitted by ${user.name} via ${payment_mode || 'Bank Transfer'} (Ref: ${reference_number || 'N/A'}). Awaiting Accounts Verification.`,
+    user.id
+  );
 
-  logActivity(user.id, 'PAYMENT_SUBMITTED', 'order', order.order_number, `${user.name} submitted payment ${payNumber} of ₹${paymentAmt.toLocaleString('en-IN')} for ${order.order_number} (Pending Accounts Verification)`);
-  sendNotification(null, 'accounts', 'Pending Payment Verification', `New payment of ₹${paymentAmt.toLocaleString('en-IN')} submitted for ${order.order_number} by ${user.name}`, 'warning', order.id);
+  logActivity(
+    user.id,
+    'PAYMENT_SUBMITTED',
+    'payment',
+    payNumber,
+    `${user.name} submitted payment ${payNumber} of ₹${paymentAmt.toLocaleString('en-IN')} for ${order.order_number} (Pending Accounts Verification)`
+  );
 
-  res.json({
-    message: `Payment entry ${payNumber} of ₹${paymentAmt.toLocaleString('en-IN')} submitted successfully and sent to Accounts Team for verification.`,
+  sendNotification(
+    null,
+    'accounts',
+    'Pending Payment Verification',
+    `New payment ${payNumber} of ₹${paymentAmt.toLocaleString('en-IN')} submitted for ${order.order_number} by ${user.name}`,
+    'warning',
+    order.id
+  );
+
+  return res.json({
+    success: true,
+    message: 'Payment submitted successfully and sent for Accounts verification.',
+    payment_id: newPaymentId,
     payment_number: payNumber,
-    status: 'PENDING_VERIFICATION'
+    status: 'PENDING_VERIFICATION',
+    amount: paymentAmt,
+    current_verified: currentVerified,
+    pending_amount: currentPending
   });
+}
+
+// Endpoint 1: POST /api/orders/:id/add-payment
+apiRouter.post('/orders/:id/add-payment', authMiddleware, (req: AuthRequest, res: Response) => {
+  executePaymentSubmission(req, res, req.params.id, req.body);
+});
+
+// Endpoint 2: POST /api/payments
+apiRouter.post('/payments', authMiddleware, (req: AuthRequest, res: Response) => {
+  executePaymentSubmission(req, res, req.body.order_id, req.body);
+});
+
+// Endpoint 3: POST /api/payments/add
+apiRouter.post('/payments/add', authMiddleware, (req: AuthRequest, res: Response) => {
+  executePaymentSubmission(req, res, req.body.order_id, req.body);
 });
 
 apiRouter.post('/payments/:id/verify', authMiddleware, requirePermission('payments:verify'), (req: AuthRequest, res) => {
@@ -2907,7 +3127,11 @@ apiRouter.post('/orders/:id/complete', authMiddleware, requirePermission('orders
 // SALES PERSONS PERFORMANCE & PROFILES
 // -------------------------------------------------------------
 
-apiRouter.get('/sales-persons', authMiddleware, (_req, res) => {
+apiRouter.get('/sales-persons', authMiddleware, (req: AuthRequest, res) => {
+  const user = req.user!;
+  const isSalesPerson = user.role_slug === 'sales_person';
+  const filterSalesPersonId = isSalesPerson ? `AND u.id = ${user.id}` : '';
+
   const salesPersons = db.prepare(`
     SELECT u.id, u.name, u.email, u.mobile, u.employee_id, u.avatar_url, u.status,
            COUNT(DISTINCT v.id) as vendor_count,
@@ -2919,7 +3143,7 @@ apiRouter.get('/sales-persons', authMiddleware, (_req, res) => {
     JOIN roles r ON u.role_id = r.id
     LEFT JOIN vendors v ON u.id = v.assigned_sales_person_id
     LEFT JOIN orders o ON u.id = o.sales_person_id
-    WHERE r.slug = 'sales_person'
+    WHERE r.slug = 'sales_person' ${filterSalesPersonId}
     GROUP BY u.id
     ORDER BY total_sales DESC
   `).all();
@@ -2927,9 +3151,15 @@ apiRouter.get('/sales-persons', authMiddleware, (_req, res) => {
   res.json({ salesPersons });
 });
 
-apiRouter.get('/sales-persons/:id', authMiddleware, (req, res) => {
+apiRouter.get('/sales-persons/:id', authMiddleware, (req: AuthRequest, res) => {
+  const user = req.user!;
   const { id } = req.params;
   const { period } = req.query;
+
+  // Strict ownership check: Sales Person cannot view another Sales Person profile
+  if (user.role_slug === 'sales_person' && Number(id) !== user.id) {
+    return res.status(403).json({ error: 'Forbidden: Access denied. You can only view your own sales performance profile.' });
+  }
 
   const person = db.prepare(`
     SELECT u.*, r.name as role_name
@@ -2997,22 +3227,39 @@ apiRouter.get('/sales-persons/:id', authMiddleware, (req, res) => {
 // REPORTS MODULE
 // -------------------------------------------------------------
 
-apiRouter.get('/reports/:type', authMiddleware, requirePermission('reports:view'), (req, res) => {
+apiRouter.get('/reports/:type', authMiddleware, requirePermission('reports:view'), (req: AuthRequest, res) => {
+  const user = req.user!;
+  const isSalesPerson = user.role_slug === 'sales_person';
   const { type } = req.params;
   const { company_id, sales_person_id, vendor_id, status, date_from, date_to } = req.query;
 
   let whereClauses: string[] = ['1=1'];
   const params: any[] = [];
 
+  // Strict backend data isolation for Sales Persons in all reports
+  if (isSalesPerson) {
+    if (type === 'sales-person') {
+      whereClauses.push('u.id = ?');
+      params.push(user.id);
+    } else if (type === 'vendor') {
+      whereClauses.push('v.assigned_sales_person_id = ?');
+      params.push(user.id);
+    } else if (type !== 'product') {
+      whereClauses.push('o.sales_person_id = ?');
+      params.push(user.id);
+    }
+  } else {
+    if (sales_person_id && sales_person_id !== 'ALL') {
+      whereClauses.push('o.sales_person_id = ?');
+      params.push(sales_person_id);
+    }
+  }
+
   if (company_id) {
     whereClauses.push('o.company_id = ?');
     params.push(company_id);
   }
-  if (sales_person_id) {
-    whereClauses.push('o.sales_person_id = ?');
-    params.push(sales_person_id);
-  }
-  if (vendor_id) {
+  if (vendor_id && vendor_id !== 'ALL') {
     whereClauses.push('o.vendor_id = ?');
     params.push(vendor_id);
   }

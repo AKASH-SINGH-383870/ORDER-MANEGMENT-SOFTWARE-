@@ -385,8 +385,11 @@ export function initDatabase() {
       { module: 'Dispatch', action: 'Update Dispatch', code: 'dispatch:update', description: 'Update LR, tracking numbers and fleet information' },
       { module: 'Delivery', action: 'View Delivery', code: 'delivery:view', description: 'View proof of delivery records' },
       { module: 'Delivery', action: 'Update Delivery', code: 'delivery:update', description: 'Record receiver acknowledgement and closure' },
+      { module: 'Payments', action: 'View All Payments', code: 'payments:view_all', description: 'Access enterprise-wide customer payment ledger' },
+      { module: 'Payments', action: 'View Own Payments', code: 'payments:view_own', description: 'Access only own customer payment records' },
       { module: 'Payments', action: 'View Payments', code: 'payments:view', description: 'Access customer payment ledger' },
       { module: 'Payments', action: 'Add Payment', code: 'payments:add', description: 'Submit / record new payment transaction' },
+      { module: 'Payments', action: 'Submit Payment', code: 'payments:submit', description: 'Submit customer payment entry for accounts verification' },
       { module: 'Payments', action: 'Verify Payment', code: 'payments:verify', description: 'Approve or reject customer payment entries' },
       { module: 'Reports', action: 'View Reports', code: 'reports:view', description: 'Access business, sales, and financial reports' },
       { module: 'Companies', action: 'Manage Companies', code: 'companies:manage', description: 'Manage billing entities and bank accounts' },
@@ -415,16 +418,31 @@ export function initDatabase() {
     const roles = db.prepare('SELECT id, slug FROM roles').all() as { id: number; slug: string }[];
     const insertRolePerm = db.prepare('INSERT OR IGNORE INTO role_permissions (role_id, permission_id) VALUES (?, ?)');
 
+    // Ensure Super Admin has all permissions always
+    const superAdmin = roles.find(r => r.slug === 'super_admin');
+    if (superAdmin) {
+      for (const pId of Object.values(permMap)) {
+        insertRolePerm.run(superAdmin.id, pId);
+      }
+    }
+
+    // Always ensure payment role permissions are assigned
+    const assignRoleCodes = (slug: string, codes: string[]) => {
+      const r = roles.find(x => x.slug === slug);
+      if (r) {
+        for (const c of codes) {
+          if (permMap[c]) insertRolePerm.run(r.id, permMap[c]);
+        }
+      }
+    };
+
+    assignRoleCodes('sales_person', ['payments:view_own', 'payments:submit', 'payments:add', 'payments:view']);
+    assignRoleCodes('accounts', ['payments:view_all', 'payments:verify', 'payments:add', 'payments:view']);
+    assignRoleCodes('admin', ['payments:view_all', 'payments:add', 'payments:view']);
+
     // Only assign initial baseline permissions if not already initialized
     const baselineDone = db.prepare("SELECT value FROM settings WHERE key = 'rbac_baseline_initialized'").get() as any;
     if (!baselineDone) {
-      // Ensure Super Admin has all permissions initially
-      const superAdmin = roles.find(r => r.slug === 'super_admin');
-      if (superAdmin) {
-        for (const pId of Object.values(permMap)) {
-          insertRolePerm.run(superAdmin.id, pId);
-        }
-      }
 
       // Helper to assign baseline perms if role exists
       const assignBaseline = (slug: string, codes: string[]) => {

@@ -3,6 +3,8 @@ import { BarChart3, Download, Printer, Filter, RefreshCw, FileText } from 'lucid
 import { useAuth } from '../context/AuthContext.js';
 
 export const Reports: React.FC = () => {
+  const { user } = useAuth();
+  const isSalesPerson = user?.role_slug === 'sales_person';
   const [reportType, setReportType] = useState<string>('orders');
   const [reportData, setReportData] = useState<any[]>([]);
   const [reportTitle, setReportTitle] = useState<string>('Order Master Report');
@@ -163,14 +165,20 @@ export const Reports: React.FC = () => {
 
           <div>
             <label className="block text-slate-500 font-semibold mb-1">Sales Officer</label>
-            <select
-              value={salesPersonId}
-              onChange={(e) => setSalesPersonId(e.target.value)}
-              className="w-full p-2 bg-slate-50 border border-slate-200 rounded-lg"
-            >
-              <option value="">All Sales Officers</option>
-              {salesPersons.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </select>
+            {isSalesPerson ? (
+              <div className="p-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 font-semibold text-xs">
+                Viewing: My Records ({user?.name})
+              </div>
+            ) : (
+              <select
+                value={salesPersonId}
+                onChange={(e) => setSalesPersonId(e.target.value)}
+                className="w-full p-2 bg-slate-50 border border-slate-200 rounded-lg"
+              >
+                <option value="">All Sales Officers</option>
+                {salesPersons.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            )}
           </div>
 
           <div>
